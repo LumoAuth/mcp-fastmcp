@@ -29,7 +29,7 @@ from lumoauth_fastmcp.checks import (
 from lumoauth_fastmcp.policy import ClientCredentialsToken, LumoToolPolicy
 from lumoauth_fastmcp.provider import DEFAULT_LUMOAUTH_URL, LumoAuthProvider
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "DEFAULT_LUMOAUTH_URL",
