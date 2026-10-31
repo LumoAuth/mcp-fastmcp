@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lumoauth-fastmcp"
+version = "0.1.0"
+description = "LumoAuth authentication and authorization for FastMCP servers"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+keywords = ["lumoauth", "fastmcp", "mcp", "oauth2", "dpop", "authorization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+dependencies = [
+    # FastMCP 4 is the first line with component-level AuthCheck callables,
+    # InsufficientScopeError and resource_base_url on providers.
+    "fastmcp>=4.1,<5",
+    # lumoauth.verify (at+jwt + DPoP verification) and McpResource.authorize_tool
+    # first ship in lumoauth 1.2.0.
+    "lumoauth[verify]>=1.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.urls]
+Documentation = "https://docs.lumoauth.dev/mcp/server-implementation"
+Repository = "https://github.com/lumoauth/mcp-fastmcp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lumoauth_fastmcp"]
+
+# Local development: resolve lumoauth from the sibling sdk-python checkout
+# (lumoauth.verify is not on PyPI yet). Only consulted by `uv`.
+[tool.uv.sources]
+lumoauth = { path = "../sdk-python", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
