@@ -16,7 +16,7 @@
 [![FastMCP 4.1+](https://img.shields.io/badge/fastmcp-4.1%2B-111)](https://gofastmcp.com)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-111)](#license)
 
-[Quick start](#quick-start) · [How it works](#how-it-works) · [Who is calling](#who-is-calling) · [Scopes and callers](#scopes-and-callers) · [Per-tool policy](#per-tool-policy-from-lumoauth) · [Troubleshooting](#troubleshooting) · [Docs](https://docs.lumoauth.dev/mcp/)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Who is calling](#who-is-calling) · [Scopes and callers](#scopes-and-callers) · [Step-up approval (JIT)](#step-up-approval-for-sensitive-tools-jit) · [Token Vault](#calling-third-party-apis-with-token-vault) · [Per-tool policy](#per-tool-policy-from-lumoauth) · [Tracing](#distributed-tracing-traceparent) · [Troubleshooting](#troubleshooting) · [Docs](https://docs.lumoauth.dev/mcp/)
 
 </div>
 
@@ -69,6 +69,26 @@ Require a scope, a person or an agent capability with one argument.
 
 **Policy in LumoAuth**<br>
 Grant each tool to a person or an agent in LumoAuth. A change applies within 30 seconds, without a restart.
+
+</td>
+</tr>
+<tr>
+<td valign="top">
+
+**Step-up approval (JIT)**<br>
+Require human approval (`require_jit` / `ensure_jit`) before an agent can run a high-risk tool or touch a specific record.
+
+</td>
+<td valign="top">
+
+**Token Vault for SaaS APIs**<br>
+Fetch short-lived GitHub, Slack, or Jira tokens (`auth.vault_token(...)`) scoped automatically to the current caller.
+
+</td>
+<td valign="top">
+
+**Trace correlation**<br>
+Propagate W3C `traceparent` headers so every tool authorization and Vault call links to your agent trace in LumoAuth's audit log.
 
 </td>
 </tr>
@@ -242,6 +262,15 @@ def list_invoices() -> list[dict]:
 
 `current_caller()` returns `None` on transports without OAuth, such as stdio and in-memory clients.
 
+| Property | Meaning |
+| --- | --- |
+| `caller.sub` | The user ID, or `agent_agt_…` for an autonomous agent |
+| `caller.is_agent`, `caller.agent_id` | `True` for an AI agent, and its `agt_…` ID |
+| `caller.is_delegated`, `caller.actor` | `True` when an agent acts on behalf of the user `caller.sub` |
+| `caller.scopes`, `caller.capabilities` | Granted OAuth scopes and agent capabilities |
+| `caller.is_jit`, `caller.authorization_details` | `True` when the caller holds a Just-in-Time (RFC 9396) approval, and its granted details |
+| `caller.traceparent`, `caller.trace_id` | The validated W3C `traceparent` header and 32-character trace ID of the request |
+
 ## Scopes and callers
 
 Pass the checks to FastMCP's `auth=` argument or to `AuthMiddleware`:
@@ -273,6 +302,88 @@ mcp = FastMCP(
     middleware=[AuthMiddleware(auth=require_scopes("invoices:read"))],
 )
 ```
+
+## Step-up approval for sensitive tools (JIT)
+
+**Why it is useful:** Some tools—such as refunding an invoice, wiring money, or deleting a production database—are too risky for an AI agent to run with a standing token alone. With Just-in-Time (JIT) authorization (RFC 9396 Rich Authorization Requests), your tool requires a short-lived approval for that specific action or record. When an agent calls the tool without one, the server rejects the call with an `insufficient_authorization_details` hint telling the agent exactly what approval to ask a human for (for example, via Slack or mobile push).
+
+### Guarding a tool with `require_jit` and `ensure_jit`
+
+Use `require_jit()` on `@mcp.tool(auth=...)` for static action requirements, and `ensure_jit()` inside the tool body when the required `identifier` or `locations` depend on the runtime arguments passed to the tool:
+
+```python
+from lumoauth_fastmcp import ensure_jit, require_jit
+
+# 1. Declarative check: hides the tool until the caller has a "payment_initiation" grant
+@mcp.tool(auth=require_jit("payment_initiation", actions=["refund"]))
+def refund(invoice_id: str) -> str:
+    # 2. Argument-bound check: ensures the JIT approval covers THIS specific invoice_id
+    ensure_jit("payment_initiation", actions=["refund"], identifier=invoice_id)
+    return f"Refunded {invoice_id}"
+```
+
+### Keeping the tool visible for automatic agent step-up
+
+If you want agents to see the tool in `tools/list` with their normal MCP token and receive the `insufficient_authorization_details` step-up hint when they call `tools/call`, either call `ensure_jit(...)` inside the tool body or configure `jit=` on `auth.tool_policy()`:
+
+```python
+auth = LumoAuthProvider()
+mcp = FastMCP(
+    "Invoices",
+    auth=auth,
+    middleware=[
+        auth.tool_policy(
+            jit={"refund": {"type": "payment_initiation", "actions": ["refund"]}}
+        )
+    ],
+)
+```
+
+### How clients send a JIT token
+
+A client can present its JIT approval in two ways:
+1. Directly inside the MCP access token (`authorization_details` or `permissions.authorization_details`).
+2. Alongside its normal MCP token in the `X-LumoAuth-Jit-Token` HTTP header. `LumoAuthProvider` verifies the JIT token's signature, expiry, and issuer against your organization's JWKS, confirms that its `sub` matches the MCP caller (`caller.sub` or `caller.actor`), and merges its `authorization_details` into `current_caller().authorization_details`.
+
+## Calling third-party APIs with Token Vault
+
+**Why it is useful:** Most MCP tools exist to call an external API such as GitHub, Slack, Jira, Google Workspace, or Salesforce. Hardcoding a shared API key in your MCP server gives every user and agent the same privileges, while forwarding the caller's own OAuth token violates the MCP specification. LumoAuth's Token Vault holds encrypted refresh tokens in custody and mints short-lived outbound access tokens on demand.
+
+### Fetching a token with `auth.vault_token()`
+
+Set `LUMOAUTH_AGENT_TOKEN` (or `LUMOAUTH_MCP_CLIENT_ID` and `LUMOAUTH_MCP_CLIENT_SECRET`), then call `auth.vault_token(connection_id)` inside your tool:
+
+```python
+import requests
+from fastmcp import FastMCP
+from lumoauth_fastmcp import LumoAuthProvider
+
+auth = LumoAuthProvider()
+mcp = FastMCP("Engineering", auth=auth)
+
+@mcp.tool
+def create_github_issue(repo: str, title: str) -> dict:
+    # Fetches a short-lived GitHub token from LumoAuth's Token Vault
+    gh_token = auth.vault_token("conn_github_prod")
+
+    response = requests.post(
+        f"https://api.github.com/repos/{repo}/issues",
+        headers={**gh_token.headers(), "Accept": "application/vnd.github+json"},
+        json={"title": title},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+```
+
+### Automatic user delegation
+
+`auth.vault_token()` inspects `current_caller()` automatically:
+- **Person or delegated agent (`not caller.is_agent` or `caller.is_delegated`):** Passes `{"user_id": caller.sub}` to LumoAuth so the tool acts with that specific user's connected account.
+- **Autonomous agent (`caller.is_agent` without delegation):** Requests the agent's own connection token.
+- **Explicit override:** Pass `auth.vault_token("conn_github_prod", user_id="...")` to request a specific user's grant.
+
+Returned `VaultToken` objects are cached in memory until 30 seconds before `expires_at` (`auth.vault(cache_ttl=60.0)`), so calling `vault_token()` multiple times in one turn does not make repeated network trips.
 
 ## Per-tool policy from LumoAuth
 
@@ -308,6 +419,23 @@ Relationships are part of the Fine-grained authorization add-on. Without it, eve
 
 Decisions are cached for 30 seconds (`tool_policy(cache_ttl=...)`), so a change takes effect within that time. When LumoAuth cannot be reached, the tool is rejected.
 
+## Distributed tracing (`traceparent`)
+
+**Why it is useful:** When an AI agent runs a multi-step workflow traced in Langfuse, LangSmith, Arize, or OpenTelemetry, you want to link each trace span to the exact tool authorization and Token Vault events in LumoAuth's audit log.
+
+**How it works:** When an MCP request arrives with a W3C `traceparent` HTTP header (`00-<trace-id>-<span-id>-<flags>`):
+1. `lumoauth-fastmcp` validates the header and exposes it on `current_caller().traceparent` and `current_caller().trace_id` (or via `current_traceparent()` and `current_trace_id()`).
+2. `auth.tool_policy()` and `auth.vault_token()` automatically forward the `traceparent` header to LumoAuth, which records `trace_id` on the resulting `mcp.tool.authorization` and Token Vault audit events.
+
+```python
+from lumoauth_fastmcp import current_trace_id
+
+@mcp.tool
+def refund(invoice_id: str) -> str:
+    log.info("Refunding %s in trace %s", invoice_id, current_trace_id())
+    ...
+```
+
 ## DPoP
 
 DPoP ties a token to the client's key, so a stolen copy cannot be replayed. Switch on **Require DPoP sender-constrained tokens** when all your clients can send proofs. Agents built on the LumoAuth JavaScript, Python and Go SDKs can do so. Claude Code, ChatGPT and the FastMCP client cannot.
@@ -335,7 +463,8 @@ Every argument is optional and falls back to an environment variable.
 | `resource` | `LUMOAUTH_MCP_RESOURCE` | from the registration |
 | `lumoauth_url` | `LUMOAUTH_URL` | `https://app.lumoauth.dev` |
 | `issuer` | `LUMOAUTH_ISSUER` | `{lumoauth_url}/orgs/{org_id}/api/v1` (set it for a custom domain) |
-| `client_id`, `client_secret` | `LUMOAUTH_MCP_CLIENT_ID`, `LUMOAUTH_MCP_CLIENT_SECRET` | only for `tool_policy()` |
+| `client_id`, `client_secret` | `LUMOAUTH_MCP_CLIENT_ID`, `LUMOAUTH_MCP_CLIENT_SECRET` | for `tool_policy()` and `vault_token()` |
+| `agent_token` | `LUMOAUTH_AGENT_TOKEN` | agent bearer token for `vault_token()` (optional when client credentials are set) |
 | `base_url` | | origin of the Resource URI |
 | `required_scopes` | | none |
 | `scopes_supported` | | the registration's basic scopes |
@@ -364,6 +493,8 @@ Every argument is optional and falls back to an environment variable.
 | Resource indicators | RFC 8707 |
 | DPoP | RFC 9449 |
 | JWT access tokens (`at+jwt`) | RFC 9068 |
+| Rich Authorization Requests (JIT step-up) | RFC 9396 |
+| Distributed Trace Context (`traceparent`) | W3C Trace Context |
 | Model Context Protocol authorization | MCP Authorization specification |
 
 The [MCP documentation](https://docs.lumoauth.dev/mcp/) explains how LumoAuth uses each one.

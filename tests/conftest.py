@@ -169,6 +169,7 @@ def no_lumoauth_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "LUMOAUTH_MCP_RESOURCE",
         "LUMOAUTH_MCP_CLIENT_ID",
         "LUMOAUTH_MCP_CLIENT_SECRET",
+        "LUMOAUTH_AGENT_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
     yield

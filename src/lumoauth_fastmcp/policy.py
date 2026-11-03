@@ -30,7 +30,7 @@ import threading
 import time
 from collections import OrderedDict
 from functools import partial
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import anyio
 import mcp_types as mt
@@ -47,7 +47,13 @@ from lumoauth.errors import (
 )
 from lumoauth.verify import AccessTokenClaims
 
+from lumoauth_fastmcp._asgi import current_request_auth, current_traceparent
 from lumoauth_fastmcp.caller import current_caller
+from lumoauth_fastmcp.checks import (
+    InsufficientAuthorizationDetailsError,
+    _normalize_required_details,
+    missing_authorization_details,
+)
 
 __all__ = ["LumoToolPolicy", "ClientCredentialsToken", "DecisionCache"]
 
@@ -176,6 +182,7 @@ class LumoToolPolicy(Middleware):
         cache_ttl: float = 30.0,
         filter_list: bool = True,
         max_concurrency: int = 8,
+        jit: Optional[Mapping[str, Any]] = None,
         client: Optional[LumoAuth] = None,
     ) -> None:
         env = os.environ
@@ -193,6 +200,10 @@ class LumoToolPolicy(Middleware):
         self.max_concurrency = max(1, max_concurrency)
         self.cache = DecisionCache(cache_ttl)
         self._tokens: Optional[ClientCredentialsToken] = None
+        self._jit: Dict[str, List[Dict[str, Any]]] = {}
+        if jit:
+            for tool_name, spec in jit.items():
+                self._jit[tool_name] = _normalize_required_details(spec)
 
         if client is None:
             org = org_id or getattr(provider, "org_id", None) or env.get("LUMOAUTH_ORG_ID") or None
@@ -230,8 +241,11 @@ class LumoToolPolicy(Middleware):
         cached = self.cache.get(key)
         if cached is not None:
             return cached
+        tp = caller.traceparent or current_traceparent()
         try:
-            allowed = await anyio.to_thread.run_sync(partial(self._decide, subject_type, caller.sub, tool))
+            allowed = await anyio.to_thread.run_sync(
+                partial(self._decide, subject_type, caller.sub, tool, traceparent=tp)
+            )
         except LumoAuthValidationError as exc:
             # A name LumoAuth cannot hold a policy for (too long, '/', ':' …).
             logger.warning("LumoAuth cannot authorize tool %r: %s", tool, exc)
@@ -242,15 +256,43 @@ class LumoToolPolicy(Middleware):
         self.cache.put(key, allowed)
         return allowed
 
-    def _decide(self, subject_type: str, subject_id: str, tool: str) -> bool:
+    def _call_authorize_tool(
+        self,
+        subject_type: str,
+        subject_id: str,
+        tool: str,
+        *,
+        traceparent: Optional[str] = None,
+    ) -> Any:
+        if traceparent is not None:
+            try:
+                return self._client.mcp.authorize_tool(
+                    self.server_id, subject_type, subject_id, tool, traceparent=traceparent
+                )
+            except TypeError:
+                pass
+        return self._client.mcp.authorize_tool(self.server_id, subject_type, subject_id, tool)
+
+    def _decide(
+        self,
+        subject_type: str,
+        subject_id: str,
+        tool: str,
+        *,
+        traceparent: Optional[str] = None,
+    ) -> bool:
         try:
-            decision = self._client.mcp.authorize_tool(self.server_id, subject_type, subject_id, tool)
+            decision = self._call_authorize_tool(
+                subject_type, subject_id, tool, traceparent=traceparent
+            )
         except LumoAuthAuthenticationError:
             # The cached server token was revoked or rotated: fetch a new one once.
             if self._tokens is None:
                 raise
             self._tokens.invalidate()
-            decision = self._client.mcp.authorize_tool(self.server_id, subject_type, subject_id, tool)
+            decision = self._call_authorize_tool(
+                subject_type, subject_id, tool, traceparent=traceparent
+            )
         return decision.allowed
 
     # ── FastMCP middleware hooks ──────────────────────────────────────
@@ -294,4 +336,13 @@ class LumoToolPolicy(Middleware):
             raise AuthorizationError(
                 f"Authorization failed for tool '{name}': LumoAuth policy does not allow this caller"
             )
+        jit_required = self._jit.get(name)
+        if jit_required:
+            missing = missing_authorization_details(jit_required, caller.authorization_details)
+            if missing:
+                err = InsufficientAuthorizationDetailsError(missing)
+                state = current_request_auth.get()
+                if state is not None:
+                    state.jit_failure = err
+                raise err
         return await call_next(context)

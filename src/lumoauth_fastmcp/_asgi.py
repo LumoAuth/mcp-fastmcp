@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from lumoauth.errors import LumoAuthTokenError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -28,7 +28,33 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 if TYPE_CHECKING:  # pragma: no cover
     from lumoauth_fastmcp.provider import LumoAuthProvider
 
-__all__ = ["RequestAuth", "current_request_auth", "LumoAuthHttpMiddleware", "parse_authorization"]
+__all__ = [
+    "RequestAuth",
+    "current_request_auth",
+    "current_traceparent",
+    "current_trace_id",
+    "LumoAuthHttpMiddleware",
+    "parse_authorization",
+    "parse_traceparent",
+]
+
+_TRACEPARENT_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
+_ZERO_TRACE_ID = "0" * 32
+_ZERO_SPAN_ID = "0" * 16
+
+
+def parse_traceparent(value: Optional[str]) -> Optional[Tuple[str, str]]:
+    """Validate a W3C ``traceparent`` header and return ``(traceparent, trace_id)``."""
+    if not value or not isinstance(value, str):
+        return None
+    normalized = value.strip().lower()
+    match = _TRACEPARENT_RE.match(normalized)
+    if not match:
+        return None
+    trace_id, span_id, _flags = match.group(1), match.group(2), match.group(3)
+    if trace_id == _ZERO_TRACE_ID or span_id == _ZERO_SPAN_ID:
+        return None
+    return normalized, trace_id
 
 
 @dataclass
@@ -40,11 +66,27 @@ class RequestAuth:
     proof: Optional[str]
     scheme: Optional[str]
     failure: Optional[LumoAuthTokenError] = None
+    traceparent: Optional[str] = None
+    trace_id: Optional[str] = None
+    jit_token: Optional[str] = None
+    jit_failure: Optional[Any] = None
 
 
 current_request_auth: ContextVar[Optional[RequestAuth]] = ContextVar(
     "lumoauth_fastmcp_request_auth", default=None
 )
+
+
+def current_traceparent() -> Optional[str]:
+    """The validated W3C ``traceparent`` header of the active HTTP request, if any."""
+    state = current_request_auth.get()
+    return state.traceparent if state is not None else None
+
+
+def current_trace_id() -> Optional[str]:
+    """The 32-hex W3C trace ID of the active HTTP request, if any."""
+    state = current_request_auth.get()
+    return state.trace_id if state is not None else None
 
 
 def parse_authorization(value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -120,11 +162,16 @@ class LumoAuthHttpMiddleware:
 
         headers: List[Tuple[bytes, bytes]] = list(scope.get("headers") or [])
         scheme, token = parse_authorization(_header(headers, b"authorization"))
+        tp_parsed = parse_traceparent(_header(headers, b"traceparent"))
+        jit_raw = _header(headers, b"x-lumoauth-jit-token")
         state = RequestAuth(
             method=str(scope.get("method") or "GET"),
             url=self.provider.request_url(scope),
             proof=_header(headers, b"dpop"),
             scheme=scheme,
+            traceparent=tp_parsed[0] if tp_parsed else None,
+            trace_id=tp_parsed[1] if tp_parsed else None,
+            jit_token=jit_raw.strip() if jit_raw and jit_raw.strip() else None,
         )
         if scheme == "DPoP" and token:
             rewritten = [(k, v) for (k, v) in headers if k.lower() != b"authorization"]
@@ -152,9 +199,24 @@ class LumoAuthHttpMiddleware:
                             dpop_algs=provider.dpop_algs,
                             status=int(message["status"]),
                         )
+                        if state.jit_failure is not None and int(message["status"]) == 403:
+                            challenge = rewrite_challenge(
+                                f'Bearer error="insufficient_authorization_details", '
+                                f'error_description="{_quoted(str(state.jit_failure))}"',
+                                failure=None,
+                                require_dpop=provider.require_dpop,
+                                dpop_algs=provider.dpop_algs,
+                                status=403,
+                            )
                         headers[index] = (b"www-authenticate", challenge.encode("latin-1"))
-                        message = {**message, "headers": headers}
                         break
+                if state.jit_failure is not None and int(message["status"]) == 403:
+                    hint_b64 = getattr(state.jit_failure, "header_value", None)
+                    if isinstance(hint_b64, str) and hint_b64:
+                        headers.append(
+                            (b"insufficient-authorization-details", hint_b64.encode("latin-1"))
+                        )
+                message = {**message, "headers": headers}
             await send(message)
 
         return wrapped

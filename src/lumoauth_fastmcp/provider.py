@@ -163,6 +163,7 @@ class LumoAuthProvider(AuthProvider):
         require_dpop: Optional[bool] = None,
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
+        agent_token: Optional[str] = None,
         resource_name: Optional[str] = None,
         resource_documentation: Optional[str] = None,
         registration: Optional[Union[Registration, Mapping[str, Any]]] = None,
@@ -233,6 +234,7 @@ class LumoAuthProvider(AuthProvider):
         self.client_secret: Optional[str] = (
             client_secret or env.get("LUMOAUTH_MCP_CLIENT_SECRET") or None
         )
+        self.agent_token: Optional[str] = agent_token or env.get("LUMOAUTH_AGENT_TOKEN") or None
 
         self._fetch = fetch
         self._verify_tls = verify_tls
@@ -244,6 +246,7 @@ class LumoAuthProvider(AuthProvider):
         self._jwks: Optional[JwksCache] = None
         self._lock = threading.Lock()
         self._as_metadata: Optional[Tuple[float, Dict[str, Any]]] = None
+        self._vault_client: Optional[Any] = None
 
     # ── FastMCP hooks ──────────────────────────────────────────────────
 
@@ -323,6 +326,25 @@ class LumoAuthProvider(AuthProvider):
             logger.error("LumoAuth token verification failed: %s", exc)
             return None
 
+        if state is not None:
+            if state.traceparent:
+                claims.claims["_traceparent"] = state.traceparent
+            if state.trace_id:
+                claims.claims["_trace_id"] = state.trace_id
+            if state.jit_token:
+                try:
+                    jit_claims = await anyio.to_thread.run_sync(
+                        partial(self._verify_jit_token, state.jit_token, claims)
+                    )
+                    merged = list(claims.authorization_details)
+                    for item in jit_claims.authorization_details:
+                        if item not in merged:
+                            merged.append(item)
+                    claims.claims["authorization_details"] = merged
+                    claims.claims["jit"] = True
+                except LumoAuthError as exc:
+                    logger.info("Ignored invalid X-LumoAuth-Jit-Token: %s", exc)
+
         scopes = list(claims.scopes)
         # Server-wide required scopes are checked by exact match downstream;
         # list the ones a granted wildcard covers so that check passes too.
@@ -332,6 +354,28 @@ class LumoAuthProvider(AuthProvider):
             if scope not in scopes and scope_covered(scope, claims.scopes)
         ]
         return LumoAccessToken.from_claims(token, claims, resource=self.resource or "", scopes=scopes)
+
+    def _verify_jit_token(self, jit_token: str, caller_claims: AccessTokenClaims) -> AccessTokenClaims:
+        """Verify an accompanying ``X-LumoAuth-Jit-Token`` against the org JWKS and caller subject."""
+        unverified_aud = _unverified_payload(jit_token).get("aud")
+        resource_matches = matching_audiences(unverified_aud, self.resource or "")
+        issuer_matches = matching_audiences(unverified_aud, self.issuer)
+        target_aud = (
+            resource_matches[0]
+            if resource_matches
+            else (issuer_matches[0] if issuer_matches else (self.resource or self.issuer))
+        )
+        verifier = self._verifier_for(target_aud, require_dpop_override=False)
+        jit_claims = verifier.verify(jit_token, dpop=None)
+        allowed_subjects = {caller_claims.sub}
+        if caller_claims.actor:
+            allowed_subjects.add(caller_claims.actor)
+        if jit_claims.sub not in allowed_subjects:
+            raise LumoAuthTokenError(
+                "JIT token subject does not match the MCP caller",
+                code="TOKEN_SUBJECT_MISMATCH",
+            )
+        return jit_claims
 
     # ── Verification (also usable from custom routes) ──────────────────
 
@@ -352,9 +396,13 @@ class LumoAuthProvider(AuthProvider):
         verifier = self._verifier_for(audiences[0] if audiences else self.resource)
         return verifier.verify(token, dpop=dpop)
 
-    def _verifier_for(self, resource: str) -> AccessTokenVerifier:
+    def _verifier_for(
+        self, resource: str, *, require_dpop_override: Optional[bool] = None
+    ) -> AccessTokenVerifier:
+        req_dpop = self.require_dpop if require_dpop_override is None else require_dpop_override
+        key = (self.issuer, f"{resource}#dpop={int(req_dpop)}")
         with self._lock:
-            verifier = self._verifiers.get((self.issuer, resource))
+            verifier = self._verifiers.get(key)
             if verifier is not None:
                 return verifier
             verifier = AccessTokenVerifier(
@@ -362,7 +410,7 @@ class LumoAuthProvider(AuthProvider):
                 resource,
                 fetch=self._fetch,
                 clock_skew=self._clock_skew,
-                require_dpop=self.require_dpop,
+                require_dpop=req_dpop,
                 replay_cache=self._replay_cache,
                 verify_tls=self._verify_tls,
             )
@@ -372,7 +420,7 @@ class LumoAuthProvider(AuthProvider):
             else:
                 verifier.jwks = self._jwks
             if len(self._verifiers) < _MAX_CACHED_VERIFIERS:
-                self._verifiers[(self.issuer, resource)] = verifier
+                self._verifiers[key] = verifier
             return verifier
 
     # ── Requests ───────────────────────────────────────────────────────
@@ -466,7 +514,7 @@ class LumoAuthProvider(AuthProvider):
         except ValueError as exc:
             raise LumoAuthConfigError(f"LumoAuth sent invalid JSON for {url}") from exc
 
-    # ── Per-tool authorization ─────────────────────────────────────────
+    # ── Per-tool authorization & Token Vault ──────────────────────────
 
     def tool_policy(self, **options: Any) -> Any:
         """FastMCP middleware that asks LumoAuth about each tool.
@@ -476,3 +524,44 @@ class LumoAuthProvider(AuthProvider):
         from lumoauth_fastmcp.policy import LumoToolPolicy
 
         return LumoToolPolicy(provider=self, **options)
+
+    def vault(self, **options: Any) -> Any:
+        """Return a :class:`~lumoauth_fastmcp.vault.LumoVaultClient` configured for this provider."""
+        from lumoauth_fastmcp.vault import LumoVaultClient
+
+        if not options and self._vault_client is not None:
+            return self._vault_client
+        defaults: Dict[str, Any] = {
+            "issuer": self.issuer,
+            "agent_token": self.agent_token,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "org_id": self.org_id,
+            "lumoauth_url": self.lumoauth_url,
+            "verify_tls": self._verify_tls,
+        }
+        defaults.update(options)
+        client = LumoVaultClient(**defaults)
+        if not options:
+            self._vault_client = client
+        return client
+
+    def vault_token(
+        self,
+        connection_id: str,
+        *,
+        user_id: Optional[str] = None,
+        caller: Optional[AccessTokenClaims] = None,
+        traceparent: Optional[str] = None,
+    ) -> Any:
+        """Fetch a short-lived outbound OAuth token from LumoAuth's Token Vault.
+
+        When the active MCP caller is a human user or a user-delegated agent,
+        ``user_id`` automatically defaults to ``caller.sub``.
+        """
+        return self.vault().get_token(
+            connection_id,
+            user_id=user_id,
+            caller=caller,
+            traceparent=traceparent,
+        )
