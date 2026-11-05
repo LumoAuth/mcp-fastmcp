@@ -37,7 +37,7 @@ from lumoauth_fastmcp.policy import ClientCredentialsToken, LumoToolPolicy
 from lumoauth_fastmcp.provider import DEFAULT_LUMOAUTH_URL, LumoAuthProvider
 from lumoauth_fastmcp.vault import LumoVaultClient, VaultToken, resolve_vault_user_id
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 __all__ = [
     "DEFAULT_LUMOAUTH_URL",
