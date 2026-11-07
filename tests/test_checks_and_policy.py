@@ -55,6 +55,9 @@ def test_scope_covered(required, granted, expected):
         ("anything", ["*"], True),
         ("tool:search_web", ["tool.search_web"], True),
         ("tool:search_web", ["tool.search"], False),
+        # The server lower-cases ASCII letters only.
+        ("Ünits.Read", ["Ünits.read"], True),
+        ("Ünits.Read", ["ünits.read"], False),
     ],
 )
 def test_capability_covered(required, granted, expected):

@@ -33,6 +33,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 from fastmcp.exceptions import AuthorizationError, InsufficientScopeError
 from fastmcp.utilities.authorization import AuthCheck, AuthContext
+from lumoauth.capabilities import any_capability_covers
 
 from lumoauth_fastmcp._asgi import current_request_auth
 from lumoauth_fastmcp.caller import current_caller, lumo_claims
@@ -73,32 +74,17 @@ def missing_scopes(required: Iterable[str], granted: Iterable[str]) -> List[str]
     return [scope for scope in required if not scope_covered(scope, granted_list)]
 
 
-def _normalize_capability(capability: str) -> str:
-    normalized = capability.strip().lower().replace(":", ".").replace("-", ".")
-    while ".." in normalized:
-        normalized = normalized.replace("..", ".")
-    return normalized.strip(".")
-
-
 def capability_covered(required: str, granted: Iterable[str]) -> bool:
     """LumoAuth's agent capability match (``AgentCapability::covers``).
 
-    Capabilities compare in canonical form (lower case, ``:`` and ``-`` read
-    as ``.``); ``*`` covers everything and ``users.*`` covers ``users.delete``
-    but not ``users`` itself.
+    Capabilities compare in the form that the server stores: trimmed, ASCII
+    letters in lower case, ``:`` and ``-`` read as ``.``. ``*`` covers
+    everything, and ``users.*`` covers ``users.delete`` but not ``users``
+    itself. The rules come from :func:`lumoauth.any_capability_covers`, so
+    they match the server's contract cases. Entries of *granted* that are
+    not strings are ignored.
     """
-    wanted = _normalize_capability(required)
-    if not wanted:
-        return False
-    for capability in granted:
-        have = _normalize_capability(capability)
-        if not have:
-            continue
-        if have == "*" or have == wanted:
-            return True
-        if have.endswith(".*") and wanted.startswith(have[:-1]):
-            return True
-    return False
+    return any_capability_covers(granted, required)
 
 
 def require_scopes(*scopes: str) -> AuthCheck:

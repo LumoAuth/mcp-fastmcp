@@ -28,8 +28,9 @@ dependencies = [
     # InsufficientScopeError and resource_base_url on providers.
     "fastmcp>=4.1,<5",
     # lumoauth.verify (at+jwt + DPoP verification) and McpResource.authorize_tool
-    # first ship in lumoauth 1.2.0.
-    "lumoauth[verify]>=1.2.0",
+    # first ship in lumoauth 1.2.0; lumoauth.capabilities (the server's
+    # capability matching, used by capability_covered) in 1.4.0.
+    "lumoauth[verify]>=1.4.0",
 ]
 
 [project.optional-dependencies]
