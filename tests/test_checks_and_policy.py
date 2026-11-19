@@ -49,15 +49,21 @@ def test_scope_covered(required, granted, expected):
 @pytest.mark.parametrize(
     "required, granted, expected",
     [
-        ("users.delete", ["users.*"], True),
-        ("users:delete", ["Users-*"], True),
-        ("users", ["users.*"], False),
+        ("users:delete", ["users:*"], True),
+        ("Users.Delete", ["users:*"], True),
+        ("users:delete", ["Users.*"], True),
+        ("users", ["users:*"], False),
         ("anything", ["*"], True),
-        ("tool:search_web", ["tool.search_web"], True),
-        ("tool:search_web", ["tool.search"], False),
+        ("web:search", ["web.search"], True),
+        # A '_' is part of a name: an exact capability never covers a longer one.
+        ("web:search_news", ["web:search"], False),
+        # A '-' is part of a name, not a separator.
+        ("users-delete", ["users:*"], False),
+        ("users:delete", ["users-*"], False),
+        ("pull-requests:comment", ["pull-requests:*"], True),
         # The server lower-cases ASCII letters only.
-        ("Ünits.Read", ["Ünits.read"], True),
-        ("Ünits.Read", ["ünits.read"], False),
+        ("Ünits:Read", ["Ünits:read"], True),
+        ("Ünits:Read", ["ünits:read"], False),
     ],
 )
 def test_capability_covered(required, granted, expected):
@@ -93,12 +99,14 @@ def test_require_scopes_names_the_shortfall():
 
 
 def test_require_agent_and_require_user():
-    agent = context({"sub": "agent_agt_1", "is_agent": True, "capabilities": ["billing.*"]})
+    agent = context({"sub": "agent_agt_1", "is_agent": True, "capabilities": ["billing:*"]})
     user = context({"sub": "user-1"})
     delegated = context({"sub": "user-1", "act": {"sub": "agent_agt_1"}})
     assert require_agent()(agent) is True
     assert require_agent("billing:refund")(agent) is True
-    assert require_agent("users.delete")(agent) is False
+    assert require_agent("billing.refund")(agent) is True
+    assert require_agent("billing-refund")(agent) is False
+    assert require_agent("users:delete")(agent) is False
     assert require_agent()(user) is False
     assert require_user()(user) is True
     assert require_user()(agent) is False

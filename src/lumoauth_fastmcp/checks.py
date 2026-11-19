@@ -77,12 +77,16 @@ def missing_scopes(required: Iterable[str], granted: Iterable[str]) -> List[str]
 def capability_covered(required: str, granted: Iterable[str]) -> bool:
     """LumoAuth's agent capability match (``AgentCapability::covers``).
 
-    Capabilities compare in the form that the server stores: trimmed, ASCII
-    letters in lower case, ``:`` and ``-`` read as ``.``. ``*`` covers
-    everything, and ``users.*`` covers ``users.delete`` but not ``users``
-    itself. The rules come from :func:`lumoauth.any_capability_covers`, so
-    they match the server's contract cases. Entries of *granted* that are
-    not strings are ignored.
+    Capabilities are written ``<resource>:<action>`` and compare in the
+    server's canonical form: trimmed, ASCII letters in lower case, ``.`` read
+    as ``:``. A ``-`` is part of a name, so ``users-delete`` is not
+    ``users:delete``. ``*`` covers everything, and ``users:*`` covers
+    ``users:delete`` but not ``users`` itself. The rules come from
+    :func:`lumoauth.any_capability_covers`, so they match the server's
+    contract cases. Entries of *granted* that are not strings are ignored.
+
+    Agent capabilities are judged with these rules, unlike
+    :func:`scope_covered`, which compares token scopes exactly.
     """
     return any_capability_covers(granted, required)
 
